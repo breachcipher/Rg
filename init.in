@@ -47,10 +47,34 @@ find_init() {
   return 1
 }
 
-# Auto-detect boot device - scan semua device termasuk virtual (virtio, sata, ide)
+# Cek apakah device memiliki filesystem yang valid (bukan random/partition table)
+is_valid_filesystem() {
+  local dev="$1"
+  local blktype
+  
+  # Gunakan blkid untuk cek filesystem type
+  blktype=$(blkid -s TYPE -o value "$dev" 2>/dev/null)
+  
+  case "$blktype" in
+    vfat|fat|ntfs|exfat|iso9660|udf|ext2|ext3|ext4|xfs|btrfs|f2fs)
+      return 0
+      ;;
+    *)
+      # Fallback: coba baca superblock dengan dd (hanya 4KB pertama)
+      # Hindari baca seluruh disk yang bisa trigger error
+      if dd if="$dev" of=/dev/null bs=4096 count=1 2>/dev/null; then
+        return 0
+      fi
+      return 1
+      ;;
+  esac
+}
+
+# Auto-detect boot device - AMAN untuk semua tipe filesystem
 find_boot_device() {
   local timeout=90
   local count=0
+  local tested_devices=""
 
   log_msg "Auto-detecting boot media (timeout: ${timeout}s)..."
   log_msg "Looking for /boot/lfs.squashfs on available devices..."
@@ -60,16 +84,18 @@ find_boot_device() {
   # === VMWARE/VIRTUALBOX: Cek CDROM dari IDE/SATA ===
   log_msg "Checking for VMware/VirtualBox CDROM..."
   for cdrom in /dev/sr0 /dev/sr1 /dev/cdrom /dev/cdrw /dev/dvd; do
-    if [ -b "$cdrom" ]; then
+    if [ -b "$cdrom" ] && [ ! -f "/tmp/tested_${cdrom}" ]; then
       log_msg "Testing CDROM: $cdrom"
       if mount -t iso9660 -o ro "$cdrom" "$mnt_tmp" 2>/dev/null; then
         if [ -f "$mnt_tmp/boot/lfs.squashfs" ]; then
           device="$cdrom"
           log_msg "Boot media DETECTED on $cdrom"
+          umount "$mnt_tmp" 2>/dev/null
           return 0
         fi
         umount "$mnt_tmp" 2>/dev/null
       fi
+      touch "/tmp/tested_${cdrom}"
     fi
   done
 
@@ -95,31 +121,47 @@ find_boot_device() {
         device="$vtdev"
         VENTOY_BOOT=true
         log_msg "Boot media DETECTED via Ventoy label on $vtdev"
+        umount "$mnt_tmp" 2>/dev/null
         return 0
       fi
       umount "$mnt_tmp" 2>/dev/null
     fi
   fi
 
-  # === VIRTUALBOX/VMWARE: Cek SATA/SCSI/VirtIO disks ===
-  log_msg "Checking for VirtualBox/VMware virtual disks..."
+  # === SCAN PARTITIONS dengan AMAN ===
+  # Hanya scan partition (TYPE part) dan optical (TYPE rom)
+  # SKIP whole disk (TYPE disk) untuk menghindari error exfat/invalid signature
   
-  # Tunggu device muncul (untuk USB boot)
-  sleep 2
+  log_msg "Scanning partitions only (skipping whole disks)..."
   
-  # Scan semua block device, termasuk virtual
+  # Dapatkan daftar partisi (bukan whole disk)
+  local partitions=$(lsblk -pnlo NAME,TYPE 2>/dev/null | awk '$2=="part" || $2=="rom" || $2=="crypt" {print $1}')
+  
+  # Tambahkan juga mapper devices (LVM, dm-crypt)
+  if [ -d /dev/mapper ]; then
+    for mapper in /dev/mapper/*; do
+      [ -b "$mapper" ] && partitions="$partitions $mapper"
+    done
+  fi
+  
   while [ $count -lt $timeout ]; do
-    # lsblk: ambil semua TYPE disk, part, rom (skip loop)
-    for dev in $(lsblk -pnlo NAME,TYPE 2>/dev/null | awk '$2=="disk" || $2=="part" || $2=="rom" {print $1}'); do
+    for dev in $partitions; do
       [ -b "$dev" ] || continue
       
-      # Skip loop devices (tidak mungkin boot dari loop)
-      case "$dev" in
-        /dev/loop*) continue ;;
-      esac
+      # Skip device yang sudah di-test
+      echo "$tested_devices" | grep -q "$dev" && continue
       
-      log_msg "Probing $dev..."
-      if mount -t auto -o ro "$dev" "$mnt_tmp" 2>/dev/null; then
+      # Cek apakah device memiliki valid filesystem
+      if ! is_valid_filesystem "$dev"; then
+        log_msg "Skipping $dev (no valid filesystem)"
+        tested_devices="$tested_devices $dev"
+        continue
+      fi
+      
+      log_msg "Probing partition: $dev"
+      
+      # Coba mount dengan read-only, timeout pendek
+      if mount -t auto -o ro,noatime "$dev" "$mnt_tmp" 2>/dev/null; then
         # Cek berbagai kemungkinan path squashfs
         if [ -f "$mnt_tmp/boot/lfs.squashfs" ]; then
           device="$dev"
@@ -130,7 +172,6 @@ find_boot_device() {
           log_msg "Boot media DETECTED on $dev (found /lfs.squashfs)"
           return 0
         elif [ -f "$mnt_tmp/LiveOS/squashfs.img" ]; then
-          # Alternative path untuk beberapa distro
           ln -sf "$mnt_tmp/LiveOS/squashfs.img" "$mnt_tmp/boot/lfs.squashfs" 2>/dev/null
           device="$dev"
           log_msg "Boot media DETECTED on $dev (found LiveOS/squashfs.img)"
@@ -138,12 +179,14 @@ find_boot_device() {
         fi
         umount "$mnt_tmp" 2>/dev/null
       fi
+      
+      tested_devices="$tested_devices $dev"
     done
 
-    # Untuk USB, perlu waktu lebih lama
     if [ $count -eq 0 ]; then
       log_msg "Waiting for devices to settle..."
       sleep 3
+      partitions=$(lsblk -pnlo NAME,TYPE 2>/dev/null | awk '$2=="part" || $2=="rom" || $2=="crypt" {print $1}')
     fi
     
     sleep 2
@@ -152,9 +195,10 @@ find_boot_device() {
   done
 
   log_msg "ERROR: No valid boot media found after ${timeout}s"
-  log_msg "Available devices:"
-  lsblk -f 2>/dev/null || true
-  blkid 2>/dev/null || true
+  log_msg "Available partitions:"
+  lsblk -f 2>/dev/null | grep -v "loop" || true
+  log_msg "Attempting to list mountable filesystems:"
+  blkid 2>/dev/null | grep -E 'TYPE="(vfat|ntfs|exfat|ext|iso|udf)"' || true
   problem
   return 1
 }
@@ -162,40 +206,128 @@ find_boot_device() {
 ensure_users() {
   log_msg "Ensuring user database exists in overlay..."
 
+  # ===================== /etc/passwd =====================
   if [ ! -f /.root/etc/passwd ] || [ ! -s /.root/etc/passwd ]; then
     log_msg "Creating minimal /etc/passwd in overlay..."
     cat > /.root/etc/passwd << 'EOF'
 root:x:0:0:root:/root:/bin/bash
 live:x:1000:1000:Live User:/home/live:/bin/bash
 nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
+bin:x:1:1:bin:/bin:/sbin/nologin
+daemon:x:2:2:daemon:/sbin:/sbin/nologin
+adm:x:3:4:adm:/var/adm:/sbin/nologin
+lp:x:4:7:lp:/var/spool/lpd:/sbin/nologin
+sync:x:5:0:sync:/sbin:/bin/sync
+shutdown:x:6:0:shutdown:/sbin:/sbin/shutdown
+halt:x:7:0:halt:/sbin:/sbin/halt
+mail:x:8:12:mail:/var/spool/mail:/sbin/nologin
+operator:x:11:0:operator:/root:/sbin/nologin
+games:x:12:100:games:/usr/games:/sbin/nologin
+ftp:x:14:50:FTP User:/var/ftp:/sbin/nologin
+systemd-network:x:192:192:systemd Network Management:/:/sbin/nologin
+dbus:x:81:81:System message bus:/:/sbin/nologin
+polkitd:x:56:56:Polkit daemon:/:/sbin/nologin
 EOF
   fi
 
+  # ===================== /etc/group =====================
   if [ ! -f /.root/etc/group ] || [ ! -s /.root/etc/group ]; then
     log_msg "Creating minimal /etc/group in overlay..."
     cat > /.root/etc/group << 'EOF'
 root:x:0:
 live:x:1000:
 nogroup:x:65534:
+bin:x:1:daemon
+daemon:x:2:
+sys:x:3:
+adm:x:4:live
+tty:x:5:
+disk:x:6:
+lp:x:7:
+mem:x:8:
+kmem:x:9:
+wheel:x:10:live
+floppy:x:11:
+mail:x:12:
+man:x:15:
+dialout:x:18:
+cdrom:x:19:live
+audio:x:20:live
+video:x:21:live
+netdev:x:22:live
+users:x:100:
+nogroup:x:65534:
+systemd-journal:x:23:
+systemd-network:x:192:
+dbus:x:81:
+polkitd:x:56:
 EOF
   fi
 
+  # ===================== /etc/shadow =====================
   if [ ! -f /.root/etc/shadow ] || [ ! -s /.root/etc/shadow ]; then
     log_msg "Creating minimal /etc/shadow in overlay..."
     cat > /.root/etc/shadow << 'EOF'
-root:*:19490:0:99999:7:::
+root::19490:0:99999:7:::
 live:$6$hrIle5KuazOX40Ge$aXM7O70/9.fvyVFD2IszFjz85qJsU/YGP2aRSkzQPVKtsOB47uXaA80NKGhSn92ZJ3RDNvC3IRnaTN8IbdodG.:19490:0:99999:7:::
 nobody:*:19490:0:99999:7:::
+bin:*:19490:0:99999:7:::
+daemon:*:19490:0:99999:7:::
 EOF
     chmod 600 /.root/etc/shadow
   fi
 
+  # ===================== /etc/gshadow =====================
+  if [ ! -f /.root/etc/gshadow ] || [ ! -s /.root/etc/gshadow ]; then
+    log_msg "Creating minimal /etc/gshadow in overlay..."
+    cat > /.root/etc/gshadow << 'EOF'
+root:::
+live:::
+nogroup:::
+EOF
+    chmod 600 /.root/etc/gshadow
+  fi
+
+  # ===================== PAM Configuration =====================
   mkdir -p /.root/etc/pam.d
+  
   cat > /.root/etc/pam.d/common-auth << 'EOF'
 auth    sufficient      pam_unix.so nullok
 auth    required        pam_deny.so
 EOF
 
+  cat > /.root/etc/pam.d/common-account << 'EOF'
+account sufficient      pam_unix.so
+account required        pam_deny.so
+EOF
+
+  cat > /.root/etc/pam.d/common-session << 'EOF'
+session sufficient      pam_unix.so
+session required        pam_deny.so
+EOF
+
+  cat > /.root/etc/pam.d/common-password << 'EOF'
+password sufficient      pam_unix.so sha512 shadow
+password required        pam_deny.so
+EOF
+
+  cat > /.root/etc/pam.d/login << 'EOF'
+# Login PAM configuration
+auth       required     pam_securetty.so
+auth       sufficient   pam_unix.so nullok
+auth       required     pam_deny.so
+account    sufficient   pam_unix.so
+account    required     pam_deny.so
+session    sufficient   pam_unix.so
+session    required     pam_deny.so
+EOF
+
+  cat > /.root/etc/pam.d/passwd << 'EOF'
+password sufficient pam_unix.so sha512 shadow
+password required   pam_deny.so
+EOF
+
+  # ===================== Home Directory & Skel =====================
   if [ ! -d /.root/home/live ]; then
     log_msg "Creating home directory for live user with standard folders..."
     mkdir -p /.root/home/live
@@ -207,47 +339,504 @@ EOF
     chmod 755 /.root/home/live/{Desktop,Documents,Downloads,Music,Pictures,Videos,Public,Templates}
     chmod 700 /.root/home/live/{.ssh,.gnupg}
     log_msg "Created standard folders for live user"
+  else
+    log_msg "Home directory exists, ensuring standard folders..."
+    for folder in Desktop Documents Downloads Music Pictures Videos Public Templates; do
+      if [ ! -d "/.root/home/live/$folder" ]; then
+        mkdir -p "/.root/home/live/$folder"
+        chown 1000:1000 "/.root/home/live/$folder"
+        chmod 755 "/.root/home/live/$folder"
+      fi
+    done
   fi
 
-  log_msg "User setup complete"
+  # ===================== /etc/skel =====================
+  if [ ! -d /.root/etc/skel ]; then
+    log_msg "Creating /etc/skel with standard folders..."
+    mkdir -p /.root/etc/skel
+    mkdir -p /.root/etc/skel/{Desktop,Documents,Downloads,Music,Pictures,Videos,Public,Templates}
+    mkdir -p /.root/etc/skel/{.local/share,.config,.cache}
+
+    cat > /.root/etc/skel/README.txt << 'EOF'
+Welcome to your new LFS system!
+
+This is your home directory. Standard folders have been created:
+- Desktop    : For desktop files
+- Documents  : For documents
+- Downloads  : For downloaded files
+- Music      : For music files
+- Pictures   : For images
+- Videos     : For video files
+- Public     : For shared files
+- Templates  : For document templates
+
+Enjoy your LFS experience!
+EOF
+
+    chown -R 0:0 /.root/etc/skel
+    chmod 755 /.root/etc/skel
+  fi
+
+  # ===================== .bashrc untuk root =====================
+  if [ ! -f /.root/root/.bashrc ]; then
+    log_msg "Creating .bashrc for root..."
+    cat > /.root/root/.bashrc << 'EOF'
+# Root .bashrc
+case $- in
+    *i*) ;;
+      *) return;;
+esac
+
+HISTCONTROL=ignoreboth
+shopt -s histappend
+HISTSIZE=1000
+HISTFILESIZE=2000
+shopt -s checkwinsize
+
+# System administrator aliases
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+alias rm='rm -i'
+alias cp='cp -i'
+alias mv='mv -i'
+
+# System admin shortcuts
+alias reboot='systemctl reboot'
+alias poweroff='systemctl poweroff'
+alias sus='systemctl suspend'
+
+# Color prompts
+if [ "$TERM" != "dumb" ]; then
+    PS1='\[\033[01;31m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]# '
+else
+    PS1='\u@\h:\w# '
+fi
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EOF
+    chmod 644 /.root/root/.bashrc
+  fi
+
+  # ===================== .bashrc untuk live user =====================
+  if [ ! -f /.root/home/live/.bashrc ]; then
+    log_msg "Creating .bashrc for live user..."
+    cat > /.root/home/live/.bashrc << 'EOF'
+# ~/.bashrc: executed by bash(1) for non-login shells.
+
+case $- in
+    *i*) ;;
+      *) return;;
+esac
+
+# History settings
+HISTCONTROL=ignoreboth
+shopt -s histappend
+HISTSIZE=1000
+HISTFILESIZE=2000
+shopt -s checkwinsize
+
+# Color prompt
+case "$TERM" in
+    xterm-color|*-256color) color_prompt=yes;;
+esac
+
+if [ "$color_prompt" = yes ]; then
+    PS1='\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+else
+    PS1='\u@\h:\w\$ '
+fi
+unset color_prompt force_color_prompt
+
+# Color ls, grep
+if [ -x /usr/bin/dircolors ]; then
+    test -r ~/.dircolors && eval "$(dircolors -b ~/.dircolors)" || eval "$(dircolors -b)"
+    alias ls='ls --color=auto'
+    alias grep='grep --color=auto'
+    alias fgrep='fgrep --color=auto'
+    alias egrep='egrep --color=auto'
+fi
+
+# User aliases
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+alias ..='cd ..'
+alias ...='cd ../..'
+alias ....='cd ../../..'
+alias update='sudo pacman -Syu || sudo apt update && sudo apt upgrade'
+alias cleanup='sudo pacman -Sc || sudo apt autoremove'
+
+# User shortcuts
+alias desktop='cd ~/Desktop'
+alias docs='cd ~/Documents'
+alias downloads='cd ~/Downloads'
+alias music='cd ~/Music'
+alias pictures='cd ~/Pictures'
+alias videos='cd ~/Videos'
+
+# XDG directories
+export XDG_DESKTOP_DIR="$HOME/Desktop"
+export XDG_DOCUMENTS_DIR="$HOME/Documents"
+export XDG_DOWNLOAD_DIR="$HOME/Downloads"
+export XDG_MUSIC_DIR="$HOME/Music"
+export XDG_PICTURES_DIR="$HOME/Pictures"
+export XDG_VIDEOS_DIR="$HOME/Videos"
+export XDG_PUBLICSHARE_DIR="$HOME/Public"
+export XDG_TEMPLATES_DIR="$HOME/Templates"
+
+# Custom PATH
+[ -d "$HOME/bin" ] && PATH="$HOME/bin:$PATH"
+[ -d "$HOME/.local/bin" ] && PATH="$HOME/.local/bin:$PATH"
+
+# Bash completion
+if [ -f /usr/share/bash-completion/bash_completion ]; then
+    . /usr/share/bash-completion/bash_completion
+fi
+
+# Source bash aliases
+[ -f ~/.bash_aliases ] && . ~/.bash_aliases
+
+# Welcome message
+echo "Welcome to LFS Live System!"
+echo "Type 'help' for available commands"
+EOF
+    chown 1000:1000 /.root/home/live/.bashrc
+    chmod 644 /.root/home/live/.bashrc
+  fi
+
+  # ===================== .profile untuk live user =====================
+  if [ ! -f /.root/home/live/.profile ]; then
+    log_msg "Creating .profile for live user..."
+    cat > /.root/home/live/.profile << 'EOF'
+# ~/.profile: executed by the command interpreter for login shells.
+
+[ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+
+# Set default editor
+export EDITOR=nano
+export VISUAL=nano
+
+# Set default browser
+export BROWSER=firefox
+
+# XDG directories
+export XDG_CONFIG_HOME="$HOME/.config"
+export XDG_CACHE_HOME="$HOME/.cache"
+export XDG_DATA_HOME="$HOME/.local/share"
+
+# User binaries
+[ -d "$HOME/bin" ] && PATH="$HOME/bin:$PATH"
+[ -d "$HOME/.local/bin" ] && PATH="$HOME/.local/bin:$PATH"
+
+# Welcome message for login shell
+echo "LeakOS Live System - $(date)"
+echo "User: live (password: live)"
+echo "Root password: root"
+echo ""
+echo "Quick commands:"
+echo "  startx          - Start GUI"
+echo "  sudo su         - Become root"
+echo "  systemctl       - Manage services"
+echo ""
+EOF
+    chown 1000:1000 /.root/home/live/.profile
+    chmod 644 /.root/home/live/.profile
+  fi
+
+  # ===================== .bash_logout =====================
+  if [ ! -f /.root/home/live/.bash_logout ]; then
+    cat > /.root/home/live/.bash_logout << 'EOF'
+# ~/.bash_logout: executed by bash(1) when login shell exits.
+
+clear
+echo "Goodbye! Thank you for using LeakOS Live System"
+EOF
+    chown 1000:1000 /.root/home/live/.bash_logout
+  fi
+
+  # ===================== .Xresources untuk live user =====================
+  if [ ! -f /.root/home/live/.Xresources ]; then
+    log_msg "Creating .Xresources for live user..."
+    cat > /.root/home/live/.Xresources << 'EOF'
+! ~/.Xresources
+! X resources configuration
+
+! URxvt (rxvt-unicode) settings
+URxvt*font:                xft:Terminus:size=12:antialias=true
+URxvt*boldFont:            xft:Terminus:size=12:bold:antialias=true
+URxvt*italicFont:          xft:Terminus:size=12:italic:antialias=true
+URxvt*boldItalicFont:      xft:Terminus:size=12:bold:italic:antialias=true
+
+! Colors
+URxvt*foreground:          #00FF00
+URxvt*background:          #000000
+URxvt*cursorColor:         #00FF00
+URxvt*color0:              #000000
+URxvt*color1:              #FF0000
+URxvt*color2:              #00FF00
+URxvt*color3:              #FFFF00
+URxvt*color4:              #0000FF
+URxvt*color5:              #FF00FF
+URxvt*color6:              #00FFFF
+URxvt*color7:              #FFFFFF
+URxvt*color8:              #808080
+URxvt*color9:              #FF8080
+URxvt*color10:             #80FF80
+URxvt*color11:             #FFFF80
+URxvt*color12:             #8080FF
+URxvt*color13:             #FF80FF
+URxvt*color14:             #80FFFF
+URxvt*color15:             #FFFFFF
+
+! URxvt behavior
+URxvt*scrollBar:           false
+URxvt*scrollTtyKeypress:   true
+URxvt*scrollWithBuffer:    true
+URxvt*secondaryScroll:     true
+URxvt*saveLines:           10000
+URxvt*transparent:         true
+URxvt*shading:             20
+URxvt*blurRadius:          5
+URxvt*cursorBlink:         true
+URxvt*pointerBlank:        true
+URxvt*mapAlert:            true
+URxvt*urgentOnBell:        true
+URxvt*visualBell:          false
+URxvt*termName:            xterm-256color
+
+! URxvt perl extensions
+URxvt*perl-ext-common:     default,selection-to-clipboard,matcher,keyboard-select,resize-font,font
+URxvt*keysym.M-u:          perl:url-select:select_next
+URxvt*matcher.button:      1
+URxvt*matcher.pattern.1:   \\bwww\\.[\\w-]+\\.[\\w./?&@~-]*|\\bhttps?://[\\w./?&@~-]*|[\\w.-]+@[\\w.-]+\\.[a-zA-Z]+\\b
+URxvt*url-launcher:        /usr/bin/xdg-open
+URxvt*url-select.launcher: /usr/bin/xdg-open
+URxvt*clipboard.autocopy:  true
+
+! Font size shortcuts
+URxvt*keysym.C-plus:       resize-font:larger
+URxvt*keysym.C-minus:      resize-font:smaller
+URxvt*keysym.C-equal:      resize-font:reset
+
+! XTerm settings
+XTerm*VT100*geometry:      80x30
+XTerm*faceName:            Terminus
+XTerm*faceSize:            12
+XTerm*renderFont:          true
+XTerm*utf8:                always
+XTerm*utf8Title:           true
+XTerm*locale:              true
+XTerm*cursorColor:         #00FF00
+XTerm*cursorBlink:         true
+XTerm*selectToClipboard:   true
+XTerm*SaveLines:           10000
+XTerm*transparent:         true
+XTerm*trimSelection:       true
+XTerm*cutNewline:          false
+XTerm*highlightSelection:  true
+XTerm*foreground:          #00FF00
+XTerm*background:          #000000
+
+! Cursor theme
+Xcursor.theme:             Adwaita
+Xcursor.size:             24
+
+! Font settings
+Xft.dpi:                  96
+Xft.antialias:            true
+Xft.hinting:              true
+Xft.hintstyle:            hintslight
+Xft.rgba:                 rgb
+
+! Window manager settings
+! For Openbox, Fluxbox, etc.
+Openbox*theme:             LFS-Dark
+Openbox*font:              Sans-10
+EOF
+    chown 1000:1000 /.root/home/live/.Xresources
+    chmod 644 /.root/home/live/.Xresources
+  fi
+
+  # ===================== .xinitrc untuk live user =====================
+  if [ ! -f /.root/home/live/.xinitrc ]; then
+    log_msg "Creating .xinitrc for live user..."
+    cat > /.root/home/live/.xinitrc << 'EOF'
+#!/bin/sh
+# ~/.xinitrc - X session startup
+
+# Load X resources
+[ -f ~/.Xresources ] && xrdb -merge ~/.Xresources
+
+# Set X keyboard layout
+setxkbmap -layout us -variant altgr-intl
+
+# Start compositor if available
+picom -b 2>/dev/null || true
+
+# Start desktop environment or window manager
+# Uncomment one of these:
+
+# GNOME
+# exec gnome-session
+
+# KDE Plasma
+# exec startplasma-x11
+
+# XFCE
+# exec startxfce4
+
+# LXDE
+# exec startlxde
+
+# Openbox (lightweight)
+# exec openbox-session
+
+# Fluxbox
+# exec fluxbox
+
+# i3wm
+# exec i3
+
+# JWM (Joe's Window Manager)
+# exec jwm
+
+# Or just a terminal
+# exec xterm
+
+# Fallback: start simple window manager if available
+if command -v openbox >/dev/null 2>&1; then
+    exec openbox-session
+elif command -v fluxbox >/dev/null 2>&1; then
+    exec fluxbox
+elif command -v jwm >/dev/null 2>&1; then
+    exec jwm
+else
+    exec xterm
+fi
+EOF
+    chmod +x /.root/home/live/.xinitrc
+    chown 1000:1000 /.root/home/live/.xinitrc
+  fi
+
+  # ===================== .config/user-dirs.dirs =====================
+  if [ ! -f /.root/home/live/.config/user-dirs.dirs ]; then
+    mkdir -p /.root/home/live/.config
+    cat > /.root/home/live/.config/user-dirs.dirs << 'EOF'
+# This file is written by xdg-user-dirs-update
+XDG_DESKTOP_DIR="$HOME/Desktop"
+XDG_DOCUMENTS_DIR="$HOME/Documents"
+XDG_DOWNLOAD_DIR="$HOME/Downloads"
+XDG_MUSIC_DIR="$HOME/Music"
+XDG_PICTURES_DIR="$HOME/Pictures"
+XDG_VIDEOS_DIR="$HOME/Videos"
+XDG_PUBLICSHARE_DIR="$HOME/Public"
+XDG_TEMPLATES_DIR="$HOME/Templates"
+EOF
+    chown -R 1000:1000 /.root/home/live/.config
+  fi
+
+  # ===================== .config/user-dirs.locale =====================
+  if [ ! -f /.root/home/live/.config/user-dirs.locale ]; then
+    echo "en_US" > /.root/home/live/.config/user-dirs.locale
+    chown 1000:1000 /.root/home/live/.config/user-dirs.locale
+  fi
+
+  # ===================== Copy skel files to live user if needed =====================
+  if [ ! -f /.root/home/live/.bashrc ] && [ -d /.root/etc/skel ]; then
+    log_msg "Copying skel files to live user home..."
+    cp -r /.root/etc/skel/. /.root/home/live/ 2>/dev/null || true
+    chown -R 1000:1000 /.root/home/live/
+  fi
+
+  # ===================== Sudoers configuration =====================
+  if [ ! -f /.root/etc/sudoers ]; then
+    log_msg "Creating sudoers file..."
+    cat > /.root/etc/sudoers << 'EOF'
+## Sudoers file for LFS Live System
+## See sudoers(5) for more information
+
+Defaults env_reset
+Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# User privilege specification
+root ALL=(ALL:ALL) ALL
+live ALL=(ALL:ALL) ALL
+
+# Allow members of group wheel to execute any command
+%wheel ALL=(ALL:ALL) ALL
+
+# Allow live user to run systemctl without password
+live ALL=(ALL) NOPASSWD: /usr/bin/systemctl reboot, /usr/bin/systemctl poweroff
+
+# See sudoers(5) for more information on "@include" directives:
+@includedir /etc/sudoers.d
+EOF
+    chmod 440 /.root/etc/sudoers
+    mkdir -p /.root/etc/sudoers.d
+  fi
+
+  # ===================== Shell setup =====================
+  # Ensure /etc/shells exists
+  if [ ! -f /.root/etc/shells ]; then
+    cat > /.root/etc/shells << 'EOF'
+/bin/sh
+/bin/bash
+/usr/bin/bash
+/bin/dash
+/usr/bin/dash
+/bin/zsh
+/usr/bin/zsh
+EOF
+  fi
+
+  # Create /etc/motd (message of the day)
+  if [ ! -f /.root/etc/motd ]; then
+    cat > /.root/etc/motd << 'EOF'
+   _      _____   _____   ___   ___  
+  | |    / _ \ \ / / __| / _ \ / _ \ 
+  | |__ | (_) \ V /\__ \| (_) | (_) |
+  |____| \___/ \_/ |___/ \___/ \___/ 
+
+  LeakOS Live System
+  -------------------------
+  Welcome! This is a live environment.
+  
+  - User: live (password: live)
+  - Root: root (password: root)
+  
+  To start GUI: startx
+  To shutdown: sudo poweroff
+  To reboot: sudo reboot
+  
+  Enjoy your LFS experience!
+EOF
+    chmod 644 /.root/etc/motd
+  fi
+
+  log_msg "User setup complete with all standard folders and configurations"
 }
 
 do_mount_root() {
   log_msg "Mounting root filesystem (squashfs + overlay)"
 
-  # Load semua module yang diperlukan untuk berbagai platform
+  # Load modules untuk berbagai filesystem
   modprobe -q squashfs 2>/dev/null || true
   modprobe -q overlay 2>/dev/null || true
   modprobe -q loop 2>/dev/null || true
   modprobe -q vfat 2>/dev/null || true
   modprobe -q iso9660 2>/dev/null || true
   modprobe -q isofs 2>/dev/null || true
+  modprobe -q exfat 2>/dev/null || true
+  modprobe -q ntfs 2>/dev/null || true
+  modprobe -q ntfs3 2>/dev/null || true
   modprobe -q usb-storage 2>/dev/null || true
   modprobe -q sr_mod 2>/dev/null || true
   
-  # VirtualBox modules
+  # Virtual modules
   modprobe -q vboxguest 2>/dev/null || true
-  modprobe -q vboxsf 2>/dev/null || true
-  
-  # VMware modules
   modprobe -q vmw_balloon 2>/dev/null || true
-  modprobe -q vmxnet3 2>/dev/null || true
-  
-  # VirtIO (KVM/QEMU)
   modprobe -q virtio 2>/dev/null || true
-  modprobe -q virtio_pci 2>/dev/null || true
-  modprobe -q virtio_blk 2>/dev/null || true
-  modprobe -q virtio_net 2>/dev/null || true
-  
-  # USB controllers
-  modprobe -q xhci_hcd 2>/dev/null || true
-  modprobe -q ehci_hcd 2>/dev/null || true
-  modprobe -q uhci_hcd 2>/dev/null || true
-  
-  # Network
-  modprobe -q e1000 2>/dev/null || true
-  modprobe -q e1000e 2>/dev/null || true
-  modprobe -q pcnet32 2>/dev/null || true
 
   mkdir -p /.root /mnt /squash /cow
   mkdir -p /cow/upper /cow/work
@@ -263,7 +852,20 @@ do_mount_root() {
   elif mountpoint -q "$mnt_tmp" 2>/dev/null; then
     mount --move "$mnt_tmp" /mnt 2>/dev/null || problem
   else
-    mount -t auto "$device" /mnt 2>/dev/null || { log_msg "Mount $device failed"; problem; }
+    log_msg "Mounting $device to /mnt..."
+    if ! mount -t auto -o ro "$device" /mnt 2>/dev/null; then
+      for fstype in vfat iso9660 exfat ntfs ext4; do
+        if mount -t $fstype -o ro "$device" /mnt 2>/dev/null; then
+          log_msg "Mounted $device as $fstype"
+          break
+        fi
+      done
+    fi
+    
+    if ! mountpoint -q /mnt; then
+      log_msg "Mount $device failed!"
+      problem
+    fi
   fi
   log_msg "Boot media mounted at /mnt"
 
@@ -291,12 +893,12 @@ do_mount_root() {
     log_msg "Failed to mount squashfs!"
     problem
   }
+  
   log_msg "squashfs mounted at /squash"
 
   mount -t tmpfs tmpfs /cow 2>/dev/null || problem
   mkdir -p /cow/upper /cow/work
 
-  # Mount overlay
   log_msg "Mounting overlay filesystem..."
   mount -t overlay overlay -o lowerdir=/squash,upperdir=/cow/upper,workdir=/cow/work /.root 2>/dev/null || {
     log_msg "Overlay mount failed!"
@@ -313,7 +915,6 @@ do_mount_root() {
   mount --move /sys  /.root/sys 2>/dev/null || log_msg "WARNING: move /sys failed"
   mount --move /run  /.root/run 2>/dev/null || log_msg "WARNING: move /run failed"
   
-  # Bind mount boot media ke dalam new root (optional)
   mkdir -p /.root/run/boot-media 2>/dev/null
   mount --bind /mnt /.root/run/boot-media 2>/dev/null || true
 
@@ -327,7 +928,6 @@ log_msg "=== LFS Live ISO Init Starting ==="
 # Setup basic directories
 mkdir -p /proc /sys /dev /run /tmp 2>/dev/null
 
-# Mount pseudo-filesystems dengan urutan yang benar
 log_msg "Mounting pseudo-filesystems..."
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || { log_msg "devtmpfs failed"; /bin/sh; }
 mount -t proc proc /proc 2>/dev/null || { log_msg "CRITICAL: proc mount failed!"; /bin/sh; }
@@ -336,7 +936,6 @@ mount -t tmpfs tmpfs /run 2>/dev/null || log_msg "tmpfs /run failed (non-fatal)"
 mkdir -p /dev/pts 2>/dev/null
 mount -t devpts devpts /dev/pts -o gid=5,mode=620 2>/dev/null || log_msg "devpts mount failed"
 
-# Read kernel cmdline
 if [ ! -r /proc/cmdline ]; then
   log_msg "WARNING: /proc/cmdline missing - remounting /proc"
   umount /proc 2>/dev/null
@@ -354,10 +953,9 @@ for param in $cmdline; do
   esac
 done
 
-# Start udev dengan aman (ignore setclock error)
+# Start udev
 log_msg "Starting udev..."
 
-# Cari udevd
 UDEVD=""
 for p in /usr/bin/udevd /usr/sbin/udevd /sbin/udevd /lib/udev/udevd /usr/lib/udev/udevd /usr/lib/systemd/systemd-udevd; do
   if [ -x "$p" ]; then
@@ -369,11 +967,9 @@ done
 if [ -z "$UDEVD" ]; then
   log_msg "WARNING: udevd not found, skipping udev"
 else
-  # Start udevd dengan opsi minimal
   $UDEVD --daemon 2>/dev/null || $UDEVD --daemon --resolve-names=never 2>/dev/null || true
   sleep 2
   
-  # Cari udevadm
   UDEVADM=""
   for p in /usr/bin/udevadm /usr/sbin/udevadm /sbin/udevadm; do
     if [ -x "$p" ]; then
@@ -383,7 +979,6 @@ else
   done
   
   if [ -n "$UDEVADM" ]; then
-    # Trigger udev events tanpa error
     $UDEVADM trigger --action=add --type=subsystems 2>/dev/null || true
     $UDEVADM trigger --action=add --type=devices 2>/dev/null || true
     $UDEVADM settle --timeout=10 2>/dev/null || true
@@ -393,22 +988,15 @@ else
   fi
 fi
 
-# Apply rootdelay if specified
-if [ -n "$rootdelay" ]; then
-  log_msg "rootdelay ${rootdelay}s"
-  sleep "$rootdelay"
-fi
+[ -n "$rootdelay" ] && { log_msg "rootdelay ${rootdelay}s"; sleep "$rootdelay"; }
 
-# Mount root filesystem
 do_mount_root || problem
 
-# Stop udev before switch_root
 log_msg "Stopping udev..."
 if [ -n "$UDEVD" ]; then
   killall -q udevd 2>/dev/null || killall -q systemd-udevd 2>/dev/null || true
 fi
 
-# Find and execute init
 INIT_PATH=$(find_init)
 if [ -z "$INIT_PATH" ]; then
   log_msg "FATAL: No valid init found in /.root!"
