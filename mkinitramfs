@@ -22,32 +22,6 @@ copy()
   fi
 }
 
-copy_with_deps()
-{
-  local src_file="$1"
-  local dest_dir="$2"
-
-  if [ -f "$src_file" ] && [ ! -f "$WDIR/$dest_dir/$(basename $src_file)" ]; then
-    cp "$src_file" "$WDIR/$dest_dir/"
-    echo "  Copied: $src_file -> $WDIR/$dest_dir/"
-
-    # Copy dependencies
-    ldd "$src_file" 2>/dev/null | while read line; do
-      case "$line" in
-        *"=>"*)
-          lib=$(echo "$line" | sed 's/.*=> //' | sed 's/ (0x.*//')
-          if [ -f "$lib" ]; then
-            cp "$lib" "$WDIR/usr/lib/" 2>/dev/null || true
-          fi
-          ;;
-        *"not found"*)
-          echo "  WARNING: Library not found for $src_file"
-          ;;
-      esac
-    done
-  fi
-}
-
 # ===================== MAIN =====================
 
 # Parse arguments
@@ -72,16 +46,9 @@ printf "Creating $INITRAMFS_FILE... "
 binfiles="sh bash cat cp dd killall ls mkdir mknod mount mountpoint"
 binfiles="$binfiles umount ln rm uname readlink basename"
 binfiles="$binfiles chmod chown find sleep echo printf"
-# Tambahan untuk Ventoy compatibility & fix loop device spam
-binfiles="$binfiles lsblk sed grep awk"
-# Tambahan untuk debugging
-binfiles="$binfiles dmesg ps kill"
+binfiles="$binfiles lsblk sed grep awk dmesg ps kill"
 
-# udevadm tidak dimasukkan ke binfiles, akan dihandle di bagian INSTALL UDEV
-
-sbinfiles="modprobe blkid switch_root"
-# Tambahan untuk filesystem
-sbinfiles="$sbinfiles mount.nfs mount.cifs mount.fuse losetup"
+sbinfiles="modprobe blkid switch_root losetup"
 
 # udevd - cari di semua lokasi
 for f in udevd systemd-udevd; do
@@ -125,19 +92,115 @@ mkdir -p $WDIR/media/ventoy
 mkdir -p $WDIR/run/initramfs/live
 mkdir -p $WDIR/run/boot-media
 
-# Untuk VirtualBox/Vmware shared folders
-mkdir -p $WDIR/media/sf_shared
-
-# Untuk USB storage
-mkdir -p $WDIR/media/usb
-
 touch $WDIR/etc/modprobe.d/modprobe.conf
 
-# Create ld.so.conf untuk library path
-cat > $WDIR/etc/ld.so.conf << 'EOF'
-/usr/lib
-/lib
-/usr/local/lib
+# ===================== CREATE ETC FILES =====================
+
+# CREATE /etc/group - CRITICAL untuk udev
+cat > $WDIR/etc/group << 'EOF'
+root:x:0:
+bin:x:1:
+daemon:x:2:
+sys:x:3:
+adm:x:4:
+tty:x:5:
+disk:x:6:
+lp:x:7:
+mem:x:8:
+kmem:x:9:
+wheel:x:10:
+floppy:x:11:
+mail:x:12:
+man:x:15:
+dialout:x:18:
+cdrom:x:19:
+audio:x:20:
+video:x:21:
+netdev:x:22:
+input:x:23:
+tape:x:24:
+users:x:100:
+nogroup:x:65534:
+systemd-journal:x:23:
+EOF
+
+# CREATE /etc/passwd untuk initramfs
+cat > $WDIR/etc/passwd << 'EOF'
+root:x:0:0:root:/root:/bin/sh
+bin:x:1:1:bin:/bin:/sbin/nologin
+daemon:x:2:2:daemon:/sbin:/sbin/nologin
+nobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin
+EOF
+
+# CREATE /etc/shadow
+cat > $WDIR/etc/shadow << 'EOF'
+root::19490:0:99999:7:::
+EOF
+chmod 600 $WDIR/etc/shadow
+
+# CREATE /etc/passwd-
+cat > $WDIR/etc/passwd- << 'EOF'
+root:x:0:0:root:/root:/bin/sh
+bin:x:1:1:bin:/bin:/sbin/nologin
+daemon:x:2:2:daemon:/sbin:/sbin/nologin
+nobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin
+EOF
+
+# CREATE /etc/group-
+cat > $WDIR/etc/group- << 'EOF'
+root:x:0:
+bin:x:1:
+daemon:x:2:
+sys:x:3:
+adm:x:4:
+tty:x:5:
+disk:x:6:
+lp:x:7:
+mem:x:8:
+kmem:x:9:
+wheel:x:10:
+floppy:x:11:
+mail:x:12:
+man:x:15:
+dialout:x:18:
+cdrom:x:19:
+audio:x:20:
+video:x:21:
+netdev:x:22:
+input:x:23:
+tape:x:24:
+users:x:100:
+nogroup:x:65534:
+EOF
+
+# CREATE /etc/nsswitch.conf
+cat > $WDIR/etc/nsswitch.conf << 'EOF'
+passwd: files
+group: files
+shadow: files
+hosts: files dns
+networks: files
+protocols: files
+services: files
+ethers: files
+rpc: files
+EOF
+
+# udev config - disable problematic rules
+cat > $WDIR/etc/udev/udev.conf << 'EOF'
+udev_log=err
+children_max=2
+exec_delay=0
+event_timeout=10
+resolve_names=never
+EOF
+
+# Disable udev rules yang bermasalah
+cat > $WDIR/etc/udev/rules.d/99-disable-problematic.rules << 'EOF'
+# Disable rules that might cause issues in initramfs
+ACTION=="add", SUBSYSTEM=="rtc", OPTIONS="ignore_device"
+SUBSYSTEM=="sound", OPTIONS="ignore_device"
+SUBSYSTEM=="drm", OPTIONS="ignore_device"
 EOF
 
 # Symlinks standar
@@ -153,56 +216,16 @@ mknod -m 640 $WDIR/dev/console c 5 1 2>/dev/null
 mknod -m 664 $WDIR/dev/null    c 1 3 2>/dev/null
 mknod -m 640 $WDIR/dev/kmsg    c 1 11 2>/dev/null
 
-# Loop devices (dibutuhkan untuk mount squashfs)
+# Loop devices
 for i in 0 1 2 3 4 5 6 7; do
   mknod -m 660 $WDIR/dev/loop$i b 7 $i 2>/dev/null
 done
-
-# SCSI/SATA devices
-for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-  mknod -m 660 $WDIR/dev/sd$i b 8 $i 2>/dev/null
-done
-
-# Virtual devices (virtio, vbox, vmw)
-mknod -m 660 $WDIR/dev/vda b 252 0 2>/dev/null
-mknod -m 660 $WDIR/dev/vdb b 252 16 2>/dev/null
-
-# ===================== UDEV CONFIG =====================
-
-# udev config - prevent setclock error
-cat > $WDIR/etc/udev/udev.conf << 'EOF'
-udev_log=err
-children_max=2
-exec_delay=0
-event_timeout=10
-resolve_names=never
-EOF
-
-# udev rules disable problematic services
-cat > $WDIR/etc/udev/rules.d/99-disable-setclock.rules << 'EOF'
-# Disable setclock service to avoid error
-ACTION=="add", SUBSYSTEM=="rtc", RUN+="/bin/true"
-SUBSYSTEM=="rtc", OPTIONS="ignore_device"
-EOF
-
-# Copy existing udev rules if any
-if [ -d /etc/udev/rules.d ]; then
-  for file in /etc/udev/rules.d/*.rules; do
-    [ -f "$file" ] && cp "$file" "$WDIR/etc/udev/rules.d/" 2>/dev/null
-  done
-fi
-
-# Firmware (optional)
-if [ -d /lib/firmware ]; then
-  cp -a /lib/firmware $WDIR/usr/lib/ 2>/dev/null || true
-fi
 
 # ===================== INSTALL INIT SCRIPT =====================
 
 install -m0755 $DATADIR/$INITIN $WDIR/init
 echo "Installed init script"
 
-# Verifikasi init ada di root
 if [ ! -f "$WDIR/init" ]; then
   echo "ERROR: Failed to install init script to $WDIR/init!"
   exit 1
@@ -210,7 +233,6 @@ fi
 
 # ===================== INSTALL BINARIES =====================
 
-# Install binaries dari /usr/bin atau /bin
 echo "Installing binaries..."
 for f in $binfiles ; do
   found=0
@@ -227,7 +249,6 @@ for f in $binfiles ; do
   fi
 done
 
-# Install sbinaries dari /usr/sbin atau /sbin
 echo "Installing sbinaries..."
 for f in $sbinfiles ; do
   found=0
@@ -249,7 +270,6 @@ done
 echo "Installing udev..."
 UDEVD_FOUND=0
 
-# Copy udevd dari semua kemungkinan lokasi
 for udevd_path in \
   /usr/lib/udev/udevd \
   /lib/udev/udevd \
@@ -264,45 +284,21 @@ do
       */udev/udevd)
         mkdir -p "$WDIR/usr/lib/udev"
         cp "$udevd_path" "$WDIR/usr/lib/udev/udevd"
-        echo "  Copied udevd from $udevd_path to /usr/lib/udev/"
-        ldd "$udevd_path" 2>/dev/null | while read line; do
-          case "$line" in
-            *"=>"*)
-              lib=$(echo "$line" | sed 's/.*=> //' | sed 's/ (0x.*//')
-              [ -f "$lib" ] && cp "$lib" "$WDIR/usr/lib/" 2>/dev/null
-              ;;
-          esac
-        done
+        echo "  Copied udevd from $udevd_path"
         UDEVD_FOUND=1
         break
         ;;
       */systemd/*)
         mkdir -p "$WDIR/usr/lib/systemd"
         cp "$udevd_path" "$WDIR/usr/lib/systemd/systemd-udevd"
-        echo "  Copied systemd-udevd from $udevd_path"
-        ldd "$udevd_path" 2>/dev/null | while read line; do
-          case "$line" in
-            *"=>"*)
-              lib=$(echo "$line" | sed 's/.*=> //' | sed 's/ (0x.*//')
-              [ -f "$lib" ] && cp "$lib" "$WDIR/usr/lib/" 2>/dev/null
-              ;;
-          esac
-        done
+        echo "  Copied systemd-udevd"
         UDEVD_FOUND=1
         break
         ;;
       *)
         mkdir -p "$WDIR/usr/sbin"
         cp "$udevd_path" "$WDIR/usr/sbin/udevd"
-        echo "  Copied udevd from $udevd_path to /usr/sbin/"
-        ldd "$udevd_path" 2>/dev/null | while read line; do
-          case "$line" in
-            *"=>"*)
-              lib=$(echo "$line" | sed 's/.*=> //' | sed 's/ (0x.*//')
-              [ -f "$lib" ] && cp "$lib" "$WDIR/usr/lib/" 2>/dev/null
-              ;;
-          esac
-        done
+        echo "  Copied udevd"
         UDEVD_FOUND=1
         break
         ;;
@@ -311,47 +307,16 @@ do
 done
 
 if [ $UDEVD_FOUND -eq 0 ]; then
-  echo "WARNING: udevd not found anywhere! udev will not work."
+  echo "WARNING: udevd not found!"
 fi
 
-# Copy udevadm - cek di SEMUA kemungkinan lokasi
+# Copy udevadm
 echo "Installing udevadm..."
-UDEVADM_FOUND=0
 for udevadm_path in /usr/sbin/udevadm /sbin/udevadm /bin/udevadm /usr/bin/udevadm; do
   if [ -x "$udevadm_path" ]; then
     mkdir -p "$WDIR/usr/bin"
     cp "$udevadm_path" "$WDIR/usr/bin/udevadm"
-    echo "  Copied udevadm from $udevadm_path to /usr/bin/udevadm"
-    
-    # Copy dependencies
-    ldd "$udevadm_path" 2>/dev/null | while read line; do
-      case "$line" in
-        *"=>"*)
-          lib=$(echo "$line" | sed 's/.*=> //' | sed 's/ (0x.*//')
-          if [ -f "$lib" ]; then
-            cp "$lib" "$WDIR/usr/lib/" 2>/dev/null || true
-            echo "    Copied lib: $(basename $lib)"
-          fi
-          ;;
-        *"not found"*)
-          echo "    WARNING: Library not found for udevadm"
-          ;;
-      esac
-    done
-    UDEVADM_FOUND=1
-    break
-  fi
-done
-
-if [ $UDEVADM_FOUND -eq 0 ]; then
-  echo "WARNING: udevadm not found anywhere! udev will not work."
-fi
-
-# Copy direktori udev helpers
-for udev_dir in /usr/lib/udev /lib/udev; do
-  if [ -d "$udev_dir" ]; then
-    cp -a "$udev_dir" "$WDIR/usr/lib/" 2>/dev/null
-    echo "  Copied udev helpers from $udev_dir"
+    echo "  Copied udevadm from $udevadm_path"
     break
   fi
 done
@@ -376,47 +341,19 @@ if [ -s "$unsorted" ]; then
 
     if [ -n "$lib_file" ]; then
       cp "$lib_file" "$WDIR/usr/lib/" 2>/dev/null
-      echo "  Copied lib: $library"
-    else
-      echo "  Warning: Library not found: $library"
     fi
   done
 fi
-
-# Copy ld-linux if needed
-for ld in /lib64/ld-linux-x86-64.so.2 /lib/ld-linux.so.2 /usr/lib/ld-linux.so; do
-  if [ -f "$ld" ] && [ ! -f "$WDIR/usr/lib/$(basename $ld)" ]; then
-    cp "$ld" "$WDIR/usr/lib/"
-    echo "  Copied ld-linux: $ld"
-  fi
-done
 
 # ===================== INSTALL KERNEL MODULES =====================
 
 if [ -n "$KERNEL_VERSION" ]; then
   echo "Installing kernel modules for $KERNEL_VERSION..."
 
-  # Daftar modul yang diperlukan untuk semua platform
   modules_needed="squashfs overlay loop vfat iso9660 isofs usb-storage sr_mod"
   modules_needed="$modules_needed xhci-hcd ehci-hcd uhci-hcd"
-  
-  # VirtualBox modules
-  modules_needed="$modules_needed vboxguest vboxsf"
-  
-  # VMware modules
-  modules_needed="$modules_needed vmw_balloon vmxnet3 vmwgfx"
-  
-  # VirtIO (KVM/QEMU)
-  modules_needed="$modules_needed virtio virtio_pci virtio_blk virtio_net virtio_gpu"
-  
-  # Network modules
-  modules_needed="$modules_needed e1000 e1000e pcnet32 r8169"
-  
-  # Storage modules
-  modules_needed="$modules_needed ahci ata_piix sd_mod"
-  
-  # Graphics (basic)
-  modules_needed="$modules_needed drm drm_kms_helper"
+  modules_needed="$modules_needed exfat ntfs"
+  modules_needed="$modules_needed virtio virtio_pci virtio_blk virtio_net"
 
   for mod in $modules_needed; do
     mod_path=$(find /lib/modules/$KERNEL_VERSION -name "${mod}.ko*" 2>/dev/null | head -1)
@@ -427,21 +364,17 @@ if [ -n "$KERNEL_VERSION" ]; then
     fi
   done
 
-  # Copy module dependency files
   mkdir -p $WDIR/usr/lib/modules/$KERNEL_VERSION
   for f in modules.dep modules.dep.bin modules.alias modules.alias.bin \
-           modules.symbols modules.symbols.bin modules.builtin modules.builtin.bin \
-           modules.builtin.modinfo modules.order modules.devname; do
+           modules.symbols modules.symbols.bin modules.builtin; do
     if [ -f "/lib/modules/$KERNEL_VERSION/$f" ]; then
       cp "/lib/modules/$KERNEL_VERSION/$f" "$WDIR/usr/lib/modules/$KERNEL_VERSION/" 2>/dev/null
     fi
   done
 
-  # Create symlink for modules
   mkdir -p $WDIR/lib/modules
   ln -sf /usr/lib/modules/$KERNEL_VERSION $WDIR/lib/modules/$KERNEL_VERSION 2>/dev/null
 
-  # Run depmod
   depmod -b $WDIR $KERNEL_VERSION 2>/dev/null
   echo "Kernel modules installed"
 fi
@@ -456,74 +389,17 @@ echo "done. (size: $SIZE)"
 # ===================== VERIFICATION =====================
 
 echo ""
-echo "=== Verifying critical binaries ==="
-critical_files="init usr/bin/sh usr/sbin/switch_root usr/bin/mount"
-critical_files="$critical_files usr/sbin/modprobe usr/bin/ls usr/bin/cat"
-critical_files="$critical_files usr/bin/lsblk usr/bin/awk usr/bin/sed"
-critical_files="$critical_files usr/bin/udevadm"
-
-for f in $critical_files; do
+echo "=== Verifying critical files ==="
+for f in init etc/group etc/passwd usr/bin/sh usr/sbin/switch_root; do
   if [ -f "$WDIR/$f" ] || [ -L "$WDIR/$f" ]; then
-    echo "  OK: /$f"
+    echo "  OK: $f"
   else
-    echo "  MISSING: /$f  <-- WARNING!"
+    echo "  MISSING: $f"
   fi
 done
 
-# Verify init ada di root cpio
-echo ""
-echo "=== Verifying init at cpio root ==="
-if zcat "$INITRAMFS_FILE" 2>/dev/null | cpio -t 2>/dev/null | grep -q "^\./init$"; then
-  echo "  OK: ./init found in initramfs"
-else
-  echo "  WARNING: ./init NOT found in initramfs cpio!"
-fi
-
-# Verify directories
-echo ""
-echo "=== Verifying mount point dirs ==="
-for d in cdrom run/live/medium run/archiso/bootmnt media/ventoy run/initramfs/live run/boot-media; do
-  if [ -d "$WDIR/$d" ]; then
-    echo "  OK: /$d"
-  else
-    echo "  MISSING: /$d"
-  fi
-done
-
-# Verify udev
-echo ""
-echo "=== udev verification ==="
-if [ -f "$WDIR/usr/lib/udev/udevd" ] || [ -f "$WDIR/usr/sbin/udevd" ] || [ -f "$WDIR/usr/lib/systemd/systemd-udevd" ]; then
-  echo "  OK: udevd found"
-else
-  echo "  WARNING: udevd not found!"
-fi
-
-if [ -f "$WDIR/usr/bin/udevadm" ]; then
-  echo "  OK: udevadm found at /usr/bin/udevadm"
-else
-  echo "  WARNING: udevadm not found!"
-fi
-
-# Verify modules
-if [ -n "$KERNEL_VERSION" ]; then
-  echo ""
-  echo "=== Kernel modules verification ==="
-  if [ -d "$WDIR/usr/lib/modules/$KERNEL_VERSION" ]; then
-    echo "  OK: Modules directory exists"
-    modcount=$(find $WDIR/usr/lib/modules/$KERNEL_VERSION -name "*.ko*" 2>/dev/null | wc -l)
-    echo "  OK: $modcount kernel modules installed"
-  else
-    echo "  WARNING: No modules directory!"
-  fi
-fi
-
-# ===================== CLEANUP =====================
-
+# Cleanup
 rm -rf $WDIR $unsorted 2>/dev/null
 
 echo ""
-echo "=========================================="
 echo "Done! Initramfs created: $INITRAMFS_FILE"
-echo "Size: $SIZE"
-echo "=========================================="
