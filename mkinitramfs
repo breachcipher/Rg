@@ -75,16 +75,7 @@ binfiles="$binfiles chmod chown find sleep echo printf"
 # Tambahan untuk Ventoy compatibility & fix loop device spam
 binfiles="$binfiles lsblk sed grep awk"
 
-# udevadm - cari di semua lokasi
-if [ -x /usr/bin/udevadm ]; then
-  binfiles="$binfiles udevadm"
-if [ -x /usr/sbin/udevadm ]; then
-  binfiles="$binfiles udevadm"
-elif [ -x /sbin/udevadm ]; then
-  binfiles="$binfiles udevadm"
-elif [ -x /bin/udevadm ]; then
-  binfiles="$binfiles udevadm"
-fi
+# udevadm tidak dimasukkan ke binfiles, akan dihandle di bagian INSTALL UDEV
 
 sbinfiles="modprobe blkid switch_root"
 
@@ -251,6 +242,14 @@ do
         mkdir -p "$WDIR/usr/lib/systemd"
         cp "$udevd_path" "$WDIR/usr/lib/systemd/systemd-udevd"
         echo "  Copied systemd-udevd from $udevd_path"
+        ldd "$udevd_path" 2>/dev/null | while read line; do
+          case "$line" in
+            *"=>"*)
+              lib=$(echo "$line" | sed 's/.*=> //' | sed 's/ (0x.*//')
+              [ -f "$lib" ] && cp "$lib" "$WDIR/usr/lib/" 2>/dev/null
+              ;;
+          esac
+        done
         UDEVD_FOUND=1
         break
         ;;
@@ -258,6 +257,14 @@ do
         mkdir -p "$WDIR/usr/sbin"
         cp "$udevd_path" "$WDIR/usr/sbin/udevd"
         echo "  Copied udevd from $udevd_path to /usr/sbin/"
+        ldd "$udevd_path" 2>/dev/null | while read line; do
+          case "$line" in
+            *"=>"*)
+              lib=$(echo "$line" | sed 's/.*=> //' | sed 's/ (0x.*//')
+              [ -f "$lib" ] && cp "$lib" "$WDIR/usr/lib/" 2>/dev/null
+              ;;
+          esac
+        done
         UDEVD_FOUND=1
         break
         ;;
@@ -269,22 +276,38 @@ if [ $UDEVD_FOUND -eq 0 ]; then
   echo "WARNING: udevd not found anywhere! udev will not work."
 fi
 
-# Copy udevadm if found separately
-for udevadm_path in /usr/sbin/udevadm /sbin/udevadm /bin/udevadm; do
-  if [ -x "$udevadm_path" ] && [ ! -f "$WDIR/usr/bin/udevadm" ]; then
+# Copy udevadm - cek di SEMUA kemungkinan lokasi
+echo "Installing udevadm..."
+UDEVADM_FOUND=0
+for udevadm_path in /usr/sbin/udevadm /sbin/udevadm /bin/udevadm /usr/bin/udevadm; do
+  if [ -x "$udevadm_path" ]; then
+    mkdir -p "$WDIR/usr/bin"
     cp "$udevadm_path" "$WDIR/usr/bin/udevadm"
-    echo "  Copied udevadm from $udevadm_path"
+    echo "  Copied udevadm from $udevadm_path to /usr/bin/udevadm"
+    
+    # Copy dependencies
     ldd "$udevadm_path" 2>/dev/null | while read line; do
       case "$line" in
         *"=>"*)
           lib=$(echo "$line" | sed 's/.*=> //' | sed 's/ (0x.*//')
-          [ -f "$lib" ] && cp "$lib" "$WDIR/usr/lib/" 2>/dev/null
+          if [ -f "$lib" ]; then
+            cp "$lib" "$WDIR/usr/lib/" 2>/dev/null || true
+            echo "    Copied lib: $(basename $lib)"
+          fi
+          ;;
+        *"not found"*)
+          echo "    WARNING: Library not found for udevadm"
           ;;
       esac
     done
+    UDEVADM_FOUND=1
     break
   fi
 done
+
+if [ $UDEVADM_FOUND -eq 0 ]; then
+  echo "WARNING: udevadm not found anywhere! udev will not work."
+fi
 
 # Copy direktori udev helpers
 for udev_dir in /usr/lib/udev /lib/udev; do
@@ -338,8 +361,7 @@ if [ -n "$KERNEL_VERSION" ]; then
   # Daftar modul yang diperlukan (+ isofs untuk Ventoy)
   modules_needed="squashfs overlay loop vfat iso9660 isofs usb-storage sr_mod"
   modules_needed="$modules_needed xhci-hcd ehci-hcd uhci-hcd"
-  modules_needed="$modules_needed virtio-gpu virtio-net virtio_blk"
-
+  
   for mod in $modules_needed; do
     mod_path=$(find /lib/modules/$KERNEL_VERSION -name "${mod}.ko*" 2>/dev/null | head -1)
     if [ -n "$mod_path" ]; then
@@ -379,6 +401,7 @@ echo "=== Verifying critical binaries ==="
 critical_files="init usr/bin/sh usr/sbin/switch_root usr/bin/mount"
 critical_files="$critical_files usr/sbin/modprobe usr/bin/ls usr/bin/cat"
 critical_files="$critical_files usr/bin/lsblk usr/bin/awk usr/bin/sed"
+critical_files="$critical_files usr/bin/udevadm"
 
 for f in $critical_files; do
   if [ -f "$WDIR/$f" ] || [ -L "$WDIR/$f" ]; then
@@ -418,7 +441,7 @@ else
 fi
 
 if [ -f "$WDIR/usr/bin/udevadm" ]; then
-  echo "  OK: udevadm found"
+  echo "  OK: udevadm found at /usr/bin/udevadm"
 else
   echo "  WARNING: udevadm not found!"
 fi
